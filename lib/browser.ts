@@ -1,6 +1,10 @@
+import { parseAutoCloseEnabled } from "@/lib/auto-close";
+import { parseNamedSessions, type NamedSession } from "@/lib/named-sessions";
 import type { UrlKeyOptions } from "@/lib/url-key";
 
 export const DUPLICATE_SETTINGS_KEY = "duplicateMatch";
+export const AUTO_CLOSE_KEY = "autoCloseDuplicates";
+export const NAMED_SESSIONS_KEY = "namedSessions";
 
 export const DEFAULT_DUPLICATE_SETTINGS: UrlKeyOptions = {
   includeQuery: false,
@@ -32,6 +36,50 @@ export async function setDuplicateSettings(
   options: UrlKeyOptions,
 ): Promise<void> {
   await chrome.storage.sync.set({ [DUPLICATE_SETTINGS_KEY]: options });
+}
+
+export async function getAutoCloseEnabled(): Promise<boolean> {
+  const stored: Record<string, unknown> =
+    await chrome.storage.sync.get(AUTO_CLOSE_KEY);
+  return parseAutoCloseEnabled(stored[AUTO_CLOSE_KEY]);
+}
+
+export async function setAutoCloseEnabled(enabled: boolean): Promise<void> {
+  await chrome.storage.sync.set({ [AUTO_CLOSE_KEY]: enabled });
+}
+
+export async function getNamedSessions(): Promise<NamedSession[]> {
+  const stored: Record<string, unknown> =
+    await chrome.storage.local.get(NAMED_SESSIONS_KEY);
+  return parseNamedSessions(stored[NAMED_SESSIONS_KEY]);
+}
+
+export async function setNamedSessions(
+  sessions: readonly NamedSession[],
+): Promise<void> {
+  await chrome.storage.local.set({ [NAMED_SESSIONS_KEY]: [...sessions] });
+}
+
+export async function restoreNamedSession(
+  session: NamedSession,
+): Promise<void> {
+  const urls = session.tabs.map((tab) => tab.url);
+  const first = urls[0];
+  if (!first) throw new Error("That session has no tabs");
+  const created = await chrome.windows.create({
+    url: urls.length === 1 ? first : urls,
+    focused: true,
+  });
+  if (!created || created.id == null) return;
+  const live = await chrome.tabs.query({ windowId: created.id });
+  const ordered = [...live].sort((left, right) => left.index - right.index);
+  await Promise.all(
+    ordered.map(async (tab, index) => {
+      const saved = session.tabs[index];
+      if (tab.id == null || !saved?.pinned) return;
+      await chrome.tabs.update(tab.id, { pinned: true });
+    }),
+  );
 }
 
 export function queryTabs(): Promise<chrome.tabs.Tab[]> {
@@ -170,13 +218,29 @@ export function onTabsChanged(listener: () => void): () => void {
 }
 
 export function onDuplicateSettingsChanged(listener: () => void): () => void {
+  return onStorageKeysChanged(
+    "sync",
+    [DUPLICATE_SETTINGS_KEY, AUTO_CLOSE_KEY],
+    listener,
+  );
+}
+
+export function onNamedSessionsChanged(listener: () => void): () => void {
+  return onStorageKeysChanged("local", [NAMED_SESSIONS_KEY], listener);
+}
+
+function onStorageKeysChanged(
+  areaName: chrome.storage.AreaName,
+  keys: readonly string[],
+  listener: () => void,
+): () => void {
   const handler = (
     changes: { [key: string]: chrome.storage.StorageChange },
     area: chrome.storage.AreaName,
   ) => {
+    if (area !== areaName) return;
     if (
-      area === "sync" &&
-      Object.prototype.hasOwnProperty.call(changes, DUPLICATE_SETTINGS_KEY)
+      keys.some((key) => Object.prototype.hasOwnProperty.call(changes, key))
     ) {
       listener();
     }

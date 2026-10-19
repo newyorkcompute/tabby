@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  BookmarkIcon,
+  CopyIcon,
+  GlobeIcon,
   HistoryIcon,
   MoonIcon,
   MoreHorizontalIcon,
@@ -7,7 +10,6 @@ import {
   PinIcon,
   Volume2Icon,
   VolumeXIcon,
-  GlobeIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -15,6 +17,15 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Command, CommandInput, CommandList } from "@/components/ui/command";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -29,6 +40,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Toaster } from "@/components/ui/sonner";
+import { Toggle } from "@/components/ui/toggle";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
   Tooltip,
@@ -41,22 +53,29 @@ import {
   addTabsToGroup,
   closeTabs,
   discardTab,
+  getAutoCloseEnabled,
   getCurrentWindow,
   getDuplicateSettings,
+  getNamedSessions,
   getRecentlyClosed,
   listTabGroups,
   listWindows,
   moveTabs,
   onDuplicateSettingsChanged,
+  onNamedSessionsChanged,
   onTabsChanged,
   openSidePanel,
   queryTabs,
+  restoreNamedSession,
   restoreSession,
+  setAutoCloseEnabled,
   setDuplicateSettings,
   setMuted,
+  setNamedSessions,
   setPinned,
   ungroupTabs,
 } from "@/lib/browser";
+import { formatCopiedUrls } from "@/lib/copy-urls";
 import {
   duplicateCount,
   duplicateSets,
@@ -64,6 +83,13 @@ import {
   type DuplicateTab,
 } from "@/lib/duplicates";
 import { groupTabs, type GroupMode } from "@/lib/group-tabs";
+import {
+  addNamedSession,
+  deleteNamedSession,
+  renameNamedSession,
+  sessionTabsFromWindow,
+  type NamedSession,
+} from "@/lib/named-sessions";
 import { searchTabs } from "@/lib/search";
 import { domainFromUrl, type UrlKeyOptions } from "@/lib/url-key";
 
@@ -354,6 +380,18 @@ function TabbyScreen({ surface }: { surface: Surface }) {
           </div>
         </div>
         {closableCount > 0 ? <Badge>{closableCount}</Badge> : null}
+        <SavedSessionsDialog
+          sessions={model.namedSessions}
+          windowTabs={model.tabs
+            .filter((tab) => tab.windowId === model.currentWindowId)
+            .map((tab) => ({
+              url: tab.url,
+              title: tab.title,
+              pinned: tab.pinned,
+              index: tab.index,
+            }))}
+          onChange={model.replaceNamedSessions}
+        />
         <ClosedMenu sessions={model.closed} />
         {surface === "popup" ? (
           <Tooltip>
@@ -445,6 +483,49 @@ function TabbyScreen({ surface }: { surface: Surface }) {
             }}
           >
             Close duplicates
+          </Button>
+        </div>
+        <div className="flex flex-wrap items-center gap-2 px-3 pb-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Toggle
+                size="sm"
+                variant="outline"
+                pressed={model.autoClose}
+                aria-label="Auto-close duplicate tabs"
+                onPressedChange={(pressed) => {
+                  void model.saveAutoClose(pressed);
+                }}
+              >
+                Auto-close
+              </Toggle>
+            </TooltipTrigger>
+            <TooltipContent>
+              Close a new duplicate and keep the existing tab
+            </TooltipContent>
+          </Tooltip>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="ml-auto"
+            onClick={() => {
+              const text = formatCopiedUrls(visual);
+              if (!text) {
+                toast.message("No URLs to copy");
+                return;
+              }
+              const count = text.split("\n").length;
+              void runAction(async () => {
+                await navigator.clipboard.writeText(text);
+                toast.success(
+                  count === 1 ? "Copied 1 URL" : `Copied ${count} URLs`,
+                );
+              }, "Couldn't copy URLs");
+            }}
+          >
+            <CopyIcon />
+            Copy URLs
           </Button>
         </div>
 
@@ -793,6 +874,188 @@ function TabRow({
   );
 }
 
+function SavedSessionsDialog({
+  sessions,
+  windowTabs,
+  onChange,
+}: {
+  sessions: readonly NamedSession[];
+  windowTabs: readonly {
+    url: string;
+    title: string;
+    pinned: boolean;
+    index: number;
+  }[];
+  onChange: (next: NamedSession[]) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
+  return (
+    <Dialog
+      onOpenChange={(open) => {
+        if (!open) {
+          setRenamingId(null);
+          setRenameValue("");
+        }
+      }}
+    >
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <DialogTrigger asChild>
+            <Button
+              type="button"
+              size="icon"
+              variant="outline"
+              aria-label="Saved sessions"
+            >
+              <BookmarkIcon />
+            </Button>
+          </DialogTrigger>
+        </TooltipTrigger>
+        <TooltipContent>Saved sessions</TooltipContent>
+      </Tooltip>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Saved sessions</DialogTitle>
+          <DialogDescription>
+            Save this window’s web tabs, then restore them in a new window.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="flex gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const tabs = sessionTabsFromWindow(windowTabs);
+            if (!name.trim()) {
+              toast.message("Name the session");
+              return;
+            }
+            if (tabs.length === 0) {
+              toast.message("This window has no web tabs");
+              return;
+            }
+            const next = addNamedSession(sessions, {
+              id: crypto.randomUUID(),
+              name,
+              savedAt: Date.now(),
+              tabs,
+            });
+            if (!next) return;
+            void runAction(async () => {
+              await onChange(next);
+              setName("");
+              toast.success(`Saved ${next[0]?.name ?? "session"}`);
+            }, "Couldn't save that session");
+          }}
+        >
+          <Input
+            value={name}
+            placeholder="Session name"
+            aria-label="Session name"
+            onChange={(event) => setName(event.target.value)}
+          />
+          <Button type="submit" size="sm">
+            Save
+          </Button>
+        </form>
+        <div className="max-h-64 space-y-2 overflow-y-auto">
+          {sessions.length === 0 ? (
+            <p className="text-muted-foreground text-xs">No saved sessions</p>
+          ) : (
+            sessions.map((session) => (
+              <div key={session.id} className="rounded-lg border px-2 py-1.5">
+                {renamingId === session.id ? (
+                  <form
+                    className="flex gap-2"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const next = renameNamedSession(
+                        sessions,
+                        session.id,
+                        renameValue,
+                      );
+                      if (!next) {
+                        toast.message("Name the session");
+                        return;
+                      }
+                      void runAction(async () => {
+                        await onChange(next);
+                        setRenamingId(null);
+                        toast.success("Renamed session");
+                      }, "Couldn't rename that session");
+                    }}
+                  >
+                    <Input
+                      value={renameValue}
+                      aria-label={`Rename ${session.name}`}
+                      onChange={(event) => setRenameValue(event.target.value)}
+                    />
+                    <Button type="submit" size="sm">
+                      Save
+                    </Button>
+                  </form>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm">{session.name}</div>
+                      <div className="text-muted-foreground text-xs">
+                        {session.tabs.length === 1
+                          ? "1 tab"
+                          : `${session.tabs.length} tabs`}
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="secondary"
+                      onClick={() => {
+                        void runAction(async () => {
+                          await restoreNamedSession(session);
+                          toast.success(`Restored ${session.name}`);
+                        }, "Couldn't restore that session");
+                      }}
+                    >
+                      Restore
+                    </Button>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => {
+                        setRenamingId(session.id);
+                        setRenameValue(session.name);
+                      }}
+                    >
+                      Rename
+                    </Button>
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => {
+                        void runAction(async () => {
+                          await onChange(
+                            deleteNamedSession(sessions, session.id),
+                          );
+                          toast.success("Deleted session");
+                        }, "Couldn't delete that session");
+                      }}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ClosedMenu({ sessions }: { sessions: chrome.sessions.Session[] }) {
   const entries = closedEntries(sessions);
   return (
@@ -873,6 +1136,8 @@ function useTabbyModel() {
   const [windows, setWindows] = useState<chrome.windows.Window[]>([]);
   const [groups, setGroups] = useState<chrome.tabGroups.TabGroup[]>([]);
   const [closed, setClosed] = useState<chrome.sessions.Session[]>([]);
+  const [namedSessions, setNamedSessionsState] = useState<NamedSession[]>([]);
+  const [autoClose, setAutoClose] = useState(false);
   const [settings, setSettings] = useState<UrlKeyOptions>({
     includeQuery: false,
     includeHash: false,
@@ -891,6 +1156,8 @@ function useTabbyModel() {
         nextGroups,
         nextClosed,
         nextSettings,
+        nextNamedSessions,
+        nextAutoClose,
         current,
       ] = await Promise.all([
         queryTabs(),
@@ -898,6 +1165,8 @@ function useTabbyModel() {
         listTabGroups(),
         getRecentlyClosed(),
         getDuplicateSettings(),
+        getNamedSessions(),
+        getAutoCloseEnabled(),
         getCurrentWindow(),
       ]);
       setTabs(nextTabs.flatMap(toTabModel));
@@ -905,6 +1174,8 @@ function useTabbyModel() {
       setGroups(nextGroups);
       setClosed(nextClosed);
       setSettings(nextSettings);
+      setNamedSessionsState(nextNamedSessions);
+      setAutoClose(nextAutoClose);
       setCurrentWindowId(current.id);
       setLoadError(null);
       setReady(true);
@@ -922,9 +1193,13 @@ function useTabbyModel() {
     const stopSettings = onDuplicateSettingsChanged(() => {
       void refresh();
     });
+    const stopSessions = onNamedSessionsChanged(() => {
+      void refresh();
+    });
     return () => {
       stopTabs();
       stopSettings();
+      stopSessions();
     };
   }, [refresh]);
 
@@ -937,16 +1212,34 @@ function useTabbyModel() {
     }
   }, []);
 
+  const saveAutoClose = useCallback(async (enabled: boolean) => {
+    setAutoClose(enabled);
+    try {
+      await setAutoCloseEnabled(enabled);
+    } catch (error: unknown) {
+      toast.error(messageFrom(error, "Couldn't save auto-close"));
+    }
+  }, []);
+
+  const replaceNamedSessions = useCallback(async (next: NamedSession[]) => {
+    setNamedSessionsState(next);
+    await setNamedSessions(next);
+  }, []);
+
   return {
     tabs,
     windows,
     groups,
     closed,
+    namedSessions,
+    autoClose,
     settings,
     currentWindowId,
     ready,
     loadError,
     saveSettings,
+    saveAutoClose,
+    replaceNamedSessions,
   };
 }
 

@@ -9,7 +9,14 @@ export default defineConfig({
   manifest: {
     name: "Tabby",
     description: "Search, tidy, and unload Chrome tabs.",
-    permissions: ["tabs", "tabGroups", "sessions", "sidePanel", "storage"],
+    permissions: [
+      "tabs",
+      "tabGroups",
+      "sessions",
+      "sidePanel",
+      "storage",
+      "clipboardWrite",
+    ],
     action: {
       default_title: "Tabby",
     },
